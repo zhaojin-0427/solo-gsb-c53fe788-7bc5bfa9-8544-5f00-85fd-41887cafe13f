@@ -158,6 +158,42 @@
         </table>
       </div>
     </section>
+
+    <!-- 术语一致性审查 -->
+    <section id="termReviewPanel" class="gap-review">
+      <h3>术语一致性审查</h3>
+      <p class="hint">上传 <strong>UTF-8 CSV</strong> 词表：恰好两列，表头依次为
+        <code>规范写法,禁用变体</code>。服务端读取每条字幕的<strong>当前可见文案</strong>
+        （修订稿优先），列出命中的禁用变体、推荐写法与<strong>从 0 起的原文字素区间</strong>
+        （UAX #29 扩展字素簇，半开区间），<strong>不会自动修改文案</strong>。
+        含拉丁字母的变体忽略大小写，且仅在命中两端相邻字素不是拉丁字母或数字时命中
+        （<code>WiFi</code> 命中「WiFi / wifi」但不命中 <code>xwifi</code> /
+        <code>WIFI1</code>）；其余变体（中文、数字等）按字面命中。大小写折叠可能
+        改变长度（如 <code>İ</code>、<code>ﬁ</code>），区间始终按原文字素定位；
+        重叠命中按<strong>字素长度 → 起点 → CSV 行序</strong>择优，同区间不重复告警。
+        审查结果只按<strong>文案</strong>判定有效性：仅改时间参数（CPS / 间隔 / 容差 /
+        采纳）结果保留；当前文案变化后，页面自动用最近一次上传成功的词表重查，
+        词表文件已不可读时提示重新上传；切换项目不串用结果。空表、空字段、折叠后
+        同一变体对应冲突写法或非法 CSV 会报错，不影响 CPS、采纳、留白与
+        JSON/SRT/ZIP 导出。</p>
+      <form id="termForm" class="delivery-form">
+        <input name="glossary" type="file" accept=".csv,text/csv,text/plain" required>
+        <button type="submit" class="primary">上传并审查</button>
+        <span id="termName" class="muted"></span>
+      </form>
+      <div id="termStats" class="stats"></div>
+      <div class="table-wrap">
+        <table id="termTable">
+          <thead>
+            <tr>
+              <th>#</th><th>cue_id</th><th>字素区间（从 0 起）</th>
+              <th>命中变体</th><th>推荐写法</th><th>当前文案（命中处高亮）</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
   </section>
 </main>
 

@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import database as db
+from . import terminology as term
 from . import verification as vfy
 from .analysis import build_analysis, revalidate_adoptions
 from .gaps import DECISIONS, compute_shot_gaps
@@ -136,6 +137,18 @@ def _timeline_hash(analysis) -> str:
     return h.hexdigest()
 
 
+def _text_hash(analysis) -> str:
+    """**文案指纹**：逐条 ord / cue_id / 当前可见文案的 SHA-256，不含任何
+    时间参数。术语一致性审查只依赖当前文案（修订稿优先），其有效性按本指纹
+    判定——仅改时间参数（CPS / 最小间隔 / 容差 / 采纳 / 撤销）指纹不变，
+    术语结论保留；文案修订 / 恢复（当前文案的真实变化）指纹必变，旧结论
+    过期：页面在自动重查与提示重传词表之间按词表快照是否仍可读二选一。"""
+    h = hashlib.sha256()
+    for rep in analysis.cues:
+        h.update(f"{rep.ord}\x1f{rep.cue_id}\x1f{rep.text}\x1e".encode("utf-8"))
+    return h.hexdigest()
+
+
 def _gap_review_payload(conn, pid: int, shots: list[Shot], analysis) -> dict:
     """镜头留白审阅：按与 SRT 导出相同的生效时间轴逐镜头计算未被字幕
     覆盖的半开区间，并叠加库中已保存的审阅结论。结论按
@@ -201,6 +214,7 @@ def _recompute_from(conn, pid: int, prow, cue_db_rows, shots, parsed) -> dict:
         "tolerance_ms": prow["tolerance_ms"],
         "created_at": prow["created_at"],
         "timeline_hash": _timeline_hash(analysis),
+        "text_hash": _text_hash(analysis),
         "shots": [{"ord": s.ord, "start_ms": s.start_ms,
                    "end_ms": s.end_ms} for s in shots],
         "cues": [_cue_row(r) for r in cue_db_rows],
@@ -669,6 +683,47 @@ async def verify_delivery(pid: int, delivery: UploadFile = File(...)):
             "delivery_name": delivery.filename or "",
             "timeline_hash": data["timeline_hash"],
             **vfy.verify_delivery(refs, delivered)}
+
+
+# ---------- 术语一致性审查 ----------
+
+@app.post("/api/projects/{pid}/terminology")
+async def review_terminology(pid: int, glossary: UploadFile = File(...)):
+    """上传术语词表 UTF-8 CSV（规范写法 / 禁用变体 两列），对项目中每条
+    字幕的**当前可见文案**（修订稿优先）做一致性审查，只读、不自动改文案。
+
+    匹配 / 重叠择优 / 字素区间映射与词表校验的全部规则见 app.terminology。
+    响应携带 project_id 与 **text_hash**（逐条 ord / cue_id / 当前文案的
+    指纹，不含时间）：术语结论按**文案**而非时间判定有效性——仅改时间
+    参数（CPS / 最小间隔 / 容差 / 采纳 / 撤销）text_hash 不变，结论保留；
+    当前文案变化（修订 / 恢复）text_hash 必变，前端在「词表快照仍可读 →
+    自动重查」与「不可读 → 提示重传词表」之间二选一。空表 / 空字段 /
+    折叠后同变体对应冲突写法 / 非法 CSV 一律 400。审查不更改任何数据与
+    JSON / SRT / ZIP 导出。
+    """
+    raw = await glossary.read()
+    try:
+        entries = term.parse_glossary(raw)
+    except term.GlossaryError as exc:
+        raise HTTPException(400, f"术语词表无效：{exc}")
+
+    with db.get_conn() as conn:
+        data = _recompute(conn, pid)
+    cues = [(c["ord"], c["cue_id"], c["text"])
+            for c in data["analysis"]["cues"]]
+    hits = term.review_texts(cues, entries)
+    hit_cues = len({h["cue_ord"] for h in hits})
+    return {
+        "project_id": data["id"],
+        "project_name": data["name"],
+        "glossary_name": glossary.filename or "",
+        "text_hash": data["text_hash"],
+        "entry_count": len(entries),
+        "cue_count": len(cues),
+        "hit_count": len(hits),
+        "cue_hit_count": hit_cues,
+        "hits": hits,
+    }
 
 
 # ---------- 静态前端 ----------

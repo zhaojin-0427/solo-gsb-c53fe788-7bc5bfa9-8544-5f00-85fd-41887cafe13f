@@ -170,3 +170,10 @@ tr.row-proposed td { }
 .verify-row.verdict-pending { background: rgba(242, 180, 65, .07); }
 .warn-text { color: var(--warn); }
 
+
+/* 术语一致性审查 */
+.term-hit { background: rgba(242,180,65,.28); border-radius: 3px; padding: 0 1px; }
+.term-range { color: var(--warn); font-weight: 600; white-space: nowrap; }
+.term-matched { color: var(--bad); font-weight: 700; }
+.term-recommend { color: var(--good); font-weight: 600; }
+.term-row { background: rgba(242, 180, 65, .05); }
