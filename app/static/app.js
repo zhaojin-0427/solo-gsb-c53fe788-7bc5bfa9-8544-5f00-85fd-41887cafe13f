@@ -14,6 +14,14 @@ const state = {
   // 读取快照，绝不读取文件框当前值，避免把改选未提交稿的结论当成旧稿的。
   verifySnapshot: null,  // {file, name, projectId} 最近一次已提交的稿件
   verifyAutoInFlight: false,  // 同一生效轴上的自动重核是否在途（防重复触发）
+  // 术语一致性审查：与核验同构的绑定，但有效性只看文案（text_hash）不看
+  // 时间——单改时间参数（最小间隔/容差/采纳）报告保留，文案修订/恢复才
+  // 作废并自动重查。词表切换同样以「上传并审查」提交动作为唯一边界。
+  termReview: null,      // 当前展示的术语报告（绑定 project_id + text_hash）
+  termSeq: 0,            // 单调递增的提交序号：使迟到的旧响应失效
+  termNotice: "",        // 无报告时术语区显示的提示（已作废 / 重新审查中）
+  termSnapshot: null,    // {file, name, projectId} 最近一次已提交的词表
+  termAutoInFlight: false,
   // 文案修订：{uid, baseVersion}。baseVersion 是打开编辑时该条的修订版本
   // （详情 text_version），保存 / 恢复时随请求上送，服务端据此识别旧页面
   // 提交（另一标签页先改过——哪怕改了又恢复回同文案——则 409）。
@@ -389,6 +397,197 @@ function renderDeliveryVerify() {
   }
 }
 
+// ---------- 术语一致性审查 ----------
+// 报告与「项目 + 当前文案（text_hash）+ 提交先后」绑定——只按文案判断
+// 有效性，不看时间（timeline_hash 含时间，是交付核验用的）：
+// - 单改时间参数（最小间隔 / 容差 / 采纳 / 撤销 / CPS 上限）不改变任何
+//   文案，text_hash 不变，已展示的报告保留，不发多余请求；
+// - 文案修订 / 恢复改变 text_hash：旧报告立即作废，自动用最近一次已提交
+//   的词表快照重新审查；快照不可读时提示重新上传词表；
+// - 词表切换以「上传并审查」提交动作为唯一边界：文件框改选未提交不换表，
+//   清空文件框不影响快照，自动重查一律读取快照；
+// - 响应指纹与本页详情不符时（另一标签页改了文案），先拉取最新详情再
+//   裁决——可接纳则直接展示，仍不符才有界重查（TERM_MAX_AUTO_ATTEMPTS）；
+// - 每次提交取递增序号 termSeq；响应到达时若已有更新的提交或已切换项目，
+//   迟到结果直接丢弃——只呈现当前项目最近一次有效提交的报告。
+const TERM_MAX_AUTO_ATTEMPTS = 3;  // 一条自动重查链最多发起的审查请求数
+
+function resetTermReview() {
+  state.termReview = null;
+  state.termNotice = "";
+  state.termSnapshot = null;       // 切换 / 新建 / 删除项目：快照不跨项目
+  state.termAutoInFlight = false;
+  state.termSeq++;                 // 使在途的旧响应全部失效
+  const f = $("#termReviewForm");
+  if (f) f.reset();
+}
+
+// 自动重查唯一可用的词表来源：最近一次**已提交**且属于当前项目的词表快照。
+// 文件框当前 files[0]（可能是改选后未提交的另一份词表）永不参与。
+function submittedTermsFile() {
+  const p = state.project;
+  const snap = state.termSnapshot;
+  if (!p || !snap || snap.projectId !== p.id) return null;
+  return snap.file || null;
+}
+
+function syncTermReview() {
+  const p = state.project;
+  const v = state.termReview;
+  if (!v) return;
+  if (!p || v.project_id !== p.id) {
+    // 项目已切换 / 删除（正常路径已由 resetTermReview 清理，此为防御）
+    state.termReview = null;
+    state.termNotice = "";
+    return;
+  }
+  if (v.text_hash === p.text_hash) return;     // 文案未变：保留（单改时间参数）
+  // 文案已变化：旧报告立即作废，不再显示。自动重查只认最近一次已提交的
+  // 词表快照——文件框里改选未提交的新词表不参与。
+  state.termReview = null;
+  const file = submittedTermsFile();
+  if (file) {
+    state.termNotice = "字幕文案已变化，正在用最近一次已提交的词表重新审查…";
+    scheduleAutoTermReview(file);
+  } else {
+    state.termNotice = "字幕文案已变化，旧术语报告已作废，请重新上传词表。";
+  }
+}
+
+function scheduleAutoTermReview(file) {
+  const p = state.project;
+  if (!p || !file || state.termAutoInFlight) return;
+  state.termAutoInFlight = true;
+  runTermReview(file, true).finally(() => { state.termAutoInFlight = false; });
+}
+
+function acceptTermReview(result) {
+  state.termNotice = "";
+  state.termReview = result;
+  renderTermReview();
+  toast(`术语审查完成：命中 ${result.hit_count} 处`);
+}
+
+async function runTermReview(file, auto, attempt = 0) {
+  const p = state.project;
+  if (!p || !file) return;
+  const seq = ++state.termSeq;
+  const fd = new FormData();
+  fd.append("terms", file);
+  try {
+    const result = await api(`/api/projects/${p.id}/term-review`,
+                             { method: "POST", body: fd });
+    // 绑定校验：只呈现当前项目最近一次有效提交的报告
+    if (seq !== state.termSeq) return;                     // 已有更新的提交
+    if (!state.project || state.project.id !== p.id) return; // 已切换项目
+    if (result.project_id !== p.id) return;                // 防御
+    if (result.text_hash === state.project.text_hash) {
+      acceptTermReview(result);        // 指纹相符：报告对当前文案有效
+      return;
+    }
+    // 指纹不符：本页详情可能已过期（另一标签页改了文案），先取最新详情再裁决
+    await reconcileTermReview(result, seq, attempt);
+  } catch (e) {
+    if (seq !== state.termSeq) return;
+    if (!state.project || state.project.id !== p.id) return;
+    if (auto) {
+      // 自动重查失败（含词表快照已不可读、有界重查失败、网络错误）：
+      // 作废旧报告，要求人工重传，绝不回退显示旧报告或文件框里的改选稿
+      state.termReview = null;
+      state.termNotice = `自动重新审查失败：${e.message}，旧术语报告已作废，请重新上传词表。`;
+      renderTermReview();
+    }
+    toast(e.message, true);
+  }
+}
+
+// 审查响应指纹与本页详情不符：本页详情可能已过期（另一标签页改了文案），
+// 先拉取该项目最新详情再裁决——
+// - 响应指纹与最新详情一致：已返回的报告按新详情仍然有效，接纳并同步页面；
+// - 仍不一致：文案在等待期间再次变化，用最近一次已提交的词表快照重查。
+// 终止条件：自动重查链达到 TERM_MAX_AUTO_ATTEMPTS 次、详情刷新失败或
+// 已提交快照不可用时立即停止，作废旧报告并提示重新上传，不无界发请求。
+async function reconcileTermReview(result, seq, attempt) {
+  const pid = result.project_id;
+  let fresh;
+  try {
+    fresh = await api(`/api/projects/${pid}`);
+  } catch (e) {
+    if (seq !== state.termSeq) return;
+    if (!state.project || state.project.id !== pid) return;
+    // 详情刷新失败：无法裁决报告是否还有效，作废旧报告并停止
+    state.termReview = null;
+    state.termNotice =
+      `项目详情刷新失败：${e.message}，术语报告已作废，请重新上传词表。`;
+    renderTermReview();
+    toast(e.message, true);
+    return;
+  }
+  if (seq !== state.termSeq) return;                     // 已有更新的提交
+  if (!state.project || state.project.id !== pid) return;  // 已切换项目
+  state.project = fresh;          // 页面详情同步到最新（另一标签页的改动）
+  if (result.text_hash === fresh.text_hash) {
+    acceptTermReview(result);       // 报告按新详情可接纳：无需重查
+    render();
+    loadProjects();
+    return;
+  }
+  // 文案在等待期间又变化：已返回的报告不可接纳，需按最新文案重查。
+  // 重查词表只取最近一次已提交快照（文件框改选未提交的新表不参与）。
+  state.termReview = null;
+  const file = submittedTermsFile();
+  if (!file) {
+    state.termNotice = "字幕文案已变化，旧术语报告已作废，请重新上传词表。";
+    render();
+    return;
+  }
+  if (attempt + 1 >= TERM_MAX_AUTO_ATTEMPTS) {
+    state.termNotice =
+      "字幕文案多次变化，自动重新审查已停止，请重新上传词表。";
+    render();
+    return;
+  }
+  state.termNotice = "字幕文案已变化，正在用最近一次已提交的词表重新审查…";
+  render();
+  await runTermReview(file, true, attempt + 1);
+}
+
+function renderTermReview() {
+  const v = state.termReview;
+  const tb = $("#termTable tbody");
+  const stats = $("#termStats");
+  tb.innerHTML = "";
+  if (!v) {
+    stats.innerHTML = "";
+    $("#termsName").textContent = state.termNotice || "";
+    return;
+  }
+  $("#termsName").textContent =
+    `已审查：${v.terms_name || (state.termSnapshot && state.termSnapshot.name) || "词表"}` +
+    `（词表 ${v.term_count} 条 / 字幕 ${v.cue_count} 条 / 命中 ${v.hit_count} 处）`;
+  const hitCues = new Set(v.hits.map(h => h.cue_uid)).size;
+  stats.innerHTML = [
+    ["词表条目", v.term_count, ""],
+    ["命中变体", v.hit_count, v.hit_count ? "bad" : "good"],
+    ["涉及字幕", hitCues, hitCues ? "warn" : "good"],
+  ].map(([k, n, cls]) => `<span class="stat ${cls}">${k} <b>${n}</b></span>`).join("");
+
+  for (const h of v.hits) {
+    const tr = document.createElement("tr");
+    tr.className = "verify-row term-hit";
+    tr.innerHTML = `
+      <td>#${h.ord}</td>
+      <td>${esc(h.cue_id)}</td>
+      <td><span class="pill term-variant">${esc(h.variant)}</span>
+        <div class="hash">词表第 ${h.row} 行</div></td>
+      <td><span class="pill term-canonical">${esc(h.canonical)}</span></td>
+      <td class="term-range">[${h.start}, ${h.end})</td>
+      <td>${esc(h.surface)}</td>
+      <td class="text-cell">${esc(h.text)}</td>`;
+    tb.appendChild(tr);
+  }
+}
+
 // ---------- 逐条文案修订 ----------
 // 每行「修订」打开表格外侧的独立编辑面板（render 全量重建表格时不受影响，
 // 草稿不丢）。保存 / 恢复都携带打开编辑时该条的修订版本作为 base_version：
@@ -530,12 +729,14 @@ async function restoreTextEdit() {
 
 function render() {
   syncDeliveryVerify();   // 先按最新生效轴同步核验状态（作废/自动重核）
+  syncTermReview();       // 再按最新文案同步术语报告（作废/自动重查）
   const p = state.project;
   if (!p) {
     closeTextEdit();
     $("#workspace").classList.add("hidden");
     $("#importPanel").classList.remove("hidden");
     renderDeliveryVerify();
+    renderTermReview();
     return;
   }
   $("#importPanel").classList.add("hidden");
@@ -638,6 +839,7 @@ function render() {
   $("#projectSelect").value = String(p.id);
   renderGapReview(p);
   renderDeliveryVerify();
+  renderTermReview();
   // 编辑面板打开期间，参数重算 / 采纳 / 别处修订等引起的刷新只更新面板
   // 静态信息（库中当前文案、字素、CPS），不覆盖编辑框里的草稿。
   if (state.textEditing) renderTextEditInfo();
@@ -667,6 +869,7 @@ $("#importForm").addEventListener("submit", async (ev) => {
   try {
     state.project = await api("/api/projects", { method: "POST", body: fd });
     resetDeliveryVerify();
+    resetTermReview();
     closeTextEdit();
     toast("导入并分析完成");
     await loadProjects();
@@ -815,12 +1018,34 @@ $("#deliveryVerifyForm").addEventListener("submit", async (ev) => {
   await runDeliveryVerify(file, false);
 });
 
+// 术语一致性审查：提交词表（UTF-8 CSV：规范写法 / 禁用变体两列），服务端
+// 按当前可见文案扫描并返回命中报告。提交动作是词表切换的唯一边界：只有
+// 点下「上传并审查」才把当前文件记为已提交词表快照，此后改选未提交或清空
+// 文件框都不影响自动重查所用词表。只读审查，失败（空表/空字段/冲突/非法
+// CSV）仅弹错，不影响当前项目数据。
+$("#termReviewForm").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  if (!state.project) return;
+  const file = ev.target.terms.files[0];
+  if (!file) return;
+  // 提交即落快照：后续清空文件框或改选未提交都不会改变自动重查所用词表
+  state.termSnapshot = {
+    file,
+    name: file.name || "词表",
+    projectId: state.project.id,
+  };
+  state.termAutoInFlight = false;
+  state.termNotice = "";
+  await runTermReview(file, false);
+});
+
 $("#deleteProjectBtn").addEventListener("click", async () => {  if (!state.project) return;
   if (!confirm(`确定删除项目「${state.project.name}」？该操作不可恢复。`)) return;
   try {
     await api(`/api/projects/${state.project.id}`, { method: "DELETE" });
     state.project = null;
     resetDeliveryVerify();
+    resetTermReview();
     closeTextEdit();
     toast("项目已删除");
     await loadProjects();
@@ -832,6 +1057,7 @@ $("#projectSelect").addEventListener("change", async (ev) => {
   const id = ev.target.value;
   if (!id) return;
   resetDeliveryVerify();   // 先作废旧项目核验并使在途响应失效，再切换
+  resetTermReview();       // 术语报告与词表快照同样不跨项目
   closeTextEdit();         // 编辑面板不跨项目保留
   try {
     state.project = await api(`/api/projects/${id}`);
@@ -842,6 +1068,7 @@ $("#projectSelect").addEventListener("change", async (ev) => {
 $("#newProjectBtn").addEventListener("click", () => {
   state.project = null;
   resetDeliveryVerify();
+  resetTermReview();
   closeTextEdit();
   $("#projectSelect").value = "";
   render();

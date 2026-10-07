@@ -158,6 +158,39 @@
         </table>
       </div>
     </section>
+
+    <!-- 术语一致性审查 -->
+    <section id="termReviewPanel" class="gap-review">
+      <h3>术语一致性审查</h3>
+      <p class="hint">上传 UTF-8 CSV 词表（表头含「规范写法」「禁用变体」两列）：
+        服务端对每条字幕的<strong>当前可见文案</strong>（修订稿优先）扫描禁用变体，
+        列出命中变体、推荐写法与从 0 起的原文字素区间（UAX #29 字素簇，半开区间
+        [起, 止)），<strong>不自动改文案</strong>。含拉丁字母的变体忽略大小写，
+        仅在两端不是拉丁字母或数字时命中；其余变体按字面命中；同一字幕内重叠命中
+        按字素长度、起点、CSV 行序择优，不重复告警。空表、空字段、折叠后同一变体
+        对应冲突写法或非法 CSV 会被拒绝。报告只随<strong>文案</strong>变化失效：
+        单改时间参数（最小间隔 / 容差 / 采纳等）保留结果；文案修订 / 恢复后自动用
+        <strong>最近一次已提交</strong>的词表重新审查（词表以「上传并审查」提交
+        动作为切换边界，改选未提交不换表；词表不可读时提示重传）。审查为只读，
+        不影响 CPS、采纳、留白结论与 JSON / SRT / ZIP 导出。</p>
+      <form id="termReviewForm" class="delivery-form">
+        <input name="terms" type="file" accept=".csv,text/csv" required>
+        <button type="submit" class="primary">上传并审查</button>
+        <span id="termsName" class="muted"></span>
+      </form>
+      <div id="termStats" class="stats"></div>
+      <div class="table-wrap">
+        <table id="termTable">
+          <thead>
+            <tr>
+              <th>字幕 #</th><th>cue_id</th><th>命中变体</th><th>推荐写法</th>
+              <th>字素区间</th><th>命中片段</th><th>当前文案</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
   </section>
 </main>
 

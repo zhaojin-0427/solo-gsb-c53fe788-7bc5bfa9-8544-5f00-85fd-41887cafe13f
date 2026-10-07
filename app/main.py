@@ -1,5 +1,5 @@
 """FastAPI 入口：项目导入、分析、采纳、逐条文案修订、镜头留白审阅、
-交付字幕核验与导出。"""
+交付字幕核验、术语一致性审查与导出。"""
 from __future__ import annotations
 
 import hashlib
@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import database as db
+from . import terms as terms_mod
 from . import verification as vfy
 from .analysis import build_analysis, revalidate_adoptions
 from .gaps import DECISIONS, compute_shot_gaps
@@ -136,6 +137,21 @@ def _timeline_hash(analysis) -> str:
     return h.hexdigest()
 
 
+def _text_hash(analysis) -> str:
+    """当前文案指纹（只含 ord / cue_id / 当前文案，不含任何时间）。
+
+    术语一致性审查的有效性只随文案变化：文案修订 / 恢复改变指纹（旧报告
+    过期），而参数重算、采纳、撤销等只动时间轴的操作指纹不变（单改时间
+    参数保留报告）。项目详情与 term-review 响应携带同一指纹，前端据此
+    判定已展示的术语报告是否过期——与 timeline_hash（含时间，交付核验
+    用）各司其职。"""
+    h = hashlib.sha256()
+    for rep in analysis.cues:
+        h.update(f"{rep.ord}\x1f{rep.cue_id}\x1f{rep.text}\x1e"
+                 .encode("utf-8"))
+    return h.hexdigest()
+
+
 def _gap_review_payload(conn, pid: int, shots: list[Shot], analysis) -> dict:
     """镜头留白审阅：按与 SRT 导出相同的生效时间轴逐镜头计算未被字幕
     覆盖的半开区间，并叠加库中已保存的审阅结论。结论按
@@ -201,6 +217,7 @@ def _recompute_from(conn, pid: int, prow, cue_db_rows, shots, parsed) -> dict:
         "tolerance_ms": prow["tolerance_ms"],
         "created_at": prow["created_at"],
         "timeline_hash": _timeline_hash(analysis),
+        "text_hash": _text_hash(analysis),
         "shots": [{"ord": s.ord, "start_ms": s.start_ms,
                    "end_ms": s.end_ms} for s in shots],
         "cues": [_cue_row(r) for r in cue_db_rows],
@@ -669,6 +686,45 @@ async def verify_delivery(pid: int, delivery: UploadFile = File(...)):
             "delivery_name": delivery.filename or "",
             "timeline_hash": data["timeline_hash"],
             **vfy.verify_delivery(refs, delivered)}
+
+
+# ---------- 术语一致性审查 ----------
+
+@app.post("/api/projects/{pid}/term-review")
+async def term_review(pid: int, terms: UploadFile = File(...)):
+    """上传术语词表（UTF-8 CSV：「规范写法」「禁用变体」两列），对项目每条
+    字幕的当前可见文案（修订稿优先）扫描禁用变体。
+
+    只读操作：报告不落库、不自动改文案，不触碰采纳、留白结论与任何导出。
+    词表非法（空表 / 空字段 / 折叠后同一变体对应冲突写法 / 非法 CSV）
+    返回 400。响应携带 project_id 与 text_hash（只含文案的指纹，与项目
+    详情同源）：报告绑定「该项目、该文案状态」——文案修订 / 恢复后旧报告
+    过期，单改时间参数（最小间隔 / 容差 / 采纳等）不影响有效性。
+    """
+    content = await terms.read()
+    try:
+        entries = terms_mod.parse_terms_csv(content)
+    except terms_mod.TermsError as exc:
+        raise HTTPException(400, str(exc))
+
+    with db.get_conn() as conn:
+        data = _recompute(conn, pid)
+    hits = []
+    for c in data["analysis"]["cues"]:
+        for h in terms_mod.scan_text(c["text"], entries):
+            hits.append({
+                "cue_uid": c["uid"], "cue_id": c["cue_id"], "ord": c["ord"],
+                "variant": h.entry.variant, "canonical": h.entry.canonical,
+                "row": h.entry.row,
+                "start": h.start, "end": h.end, "surface": h.surface,
+                "text": c["text"],
+            })
+    return {"project_id": data["id"], "project_name": data["name"],
+            "terms_name": terms.filename or "",
+            "text_hash": data["text_hash"],
+            "term_count": len(entries),
+            "cue_count": len(data["analysis"]["cues"]),
+            "hit_count": len(hits), "hits": hits}
 
 
 # ---------- 静态前端 ----------

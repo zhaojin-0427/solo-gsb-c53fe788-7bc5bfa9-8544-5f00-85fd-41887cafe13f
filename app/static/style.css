@@ -170,3 +170,9 @@ tr.row-proposed td { }
 .verify-row.verdict-pending { background: rgba(242, 180, 65, .07); }
 .warn-text { color: var(--warn); }
 
+/* 术语一致性审查 */
+.pill.term-variant { background: rgba(240,98,107,.14); color: var(--bad); }
+.pill.term-canonical { background: rgba(62,207,142,.15); color: var(--good); }
+.term-range { font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+tr.term-hit { background: rgba(240, 98, 107, .05); }
+
